@@ -9,6 +9,8 @@
   "devDependencies": {
     "@types/jest": "~29.2",
     "@types/node": "~18",
+    "@types/promptly": "^3.0.2",
+    "@types/xml2js": "^0.4.11",
     "@typescript-eslint/eslint-plugin": "~5.44",
     "@typescript-eslint/parser": "~5.44",
     "eslint": "~8.28",
@@ -36,7 +38,10 @@
   "author": "Jakub Synowiec <jsynowiec@users.noreply.github.com>",
   "license": "Apache-2.0",
   "dependencies": {
-    "tslib": "~2.4"
+    "chalk": "^5.2.0",
+    "promptly": "^3.2.0",
+    "tslib": "~2.4",
+    "xml2js": "^0.4.23"
   },
   "volta": {
     "node": "18.12.1"
