@@ -4,7 +4,7 @@ import fsPath from "node:path";
 import chalk from "chalk";
 import promptly from "promptly";
 import xml2js from "xml2js";
-import { Transform, Writable } from "node:stream";
+import { Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import readlinePromises from "node:readline/promises";
 import { program } from "commander";
@@ -213,8 +213,9 @@ async function configureLibraryBase(
     "Using first entry of first playlist as baseline for checking others: ",
     chalk.gray(resolvedPaths[0])
   );
-  const { commonPrefix, excludeIndices } =
-    findLargestCommonPrefix(resolvedPaths);
+  const { commonPrefix, excludeIndices } = findLargestCommonPrefix(
+    resolvedPaths.filter((val, index) => !httpStreamPathIndices.includes(index))
+  );
 
   if (commonPrefix === "") {
     return throwError("Could not find a common prefix!", pathsPromises);
