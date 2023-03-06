@@ -326,8 +326,8 @@ export class M3U8Tweaker {
   }
 
   private getReplacementRoot() {
-    if (typeof this.options.replacementRoot === "string") {
-      return this.options.replacementRoot;
+    if (typeof this.options.newRoot === "string") {
+      return this.options.newRoot;
     } else if (!this.options.notInteractive) {
       return promptly.prompt(
         chalk.blue("Enter the new root that is used as a replacement: "),

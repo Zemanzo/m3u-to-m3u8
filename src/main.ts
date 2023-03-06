@@ -5,7 +5,7 @@ import { M3U8Tweaker } from "./program.js";
 program
   .option(
     "-o, --oldRoot <path>",
-    "The original root that is used in the playlists."
+    "The original root that is used for tracks in the playlists. When no value is given, it will automatically detect a common root file path."
   )
   .option(
     "-n, --newRoot <path>",
@@ -14,13 +14,13 @@ program
   )
   .option(
     "-ni, --notInteractive",
-    "Whether questions should be asked to get missing data.\nFor example, when --newRoot is missing, a prompt will appear asking you to type the new root path.",
-    true
+    "Whether questions should be asked to get missing data. \nFor example, when --newRoot is missing, a prompt will appear asking you to type the new root path.\nUseful for automated systems.",
+    false
   )
   .option("-px, --purgeXml", "Purge playlists that are not in the XML.", true)
   .option(
     "-pm, --purgeMismatch",
-    "Purge playlists that have tracks do not match the original root. http streams are ignored.",
+    "Purge playlists that have tracks that do not match the original root. http streams are always ignored and will be kept.",
     true
   )
   .option(
