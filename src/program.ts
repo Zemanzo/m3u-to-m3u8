@@ -30,6 +30,7 @@ export class M3U8Tweaker {
   }
 
   async run(initialPath: unknown) {
+    this.validateStaticOptions();
     const path = await this.getPath(initialPath);
     const { playlistFiles, parsedXmlFile } = await this.getFiles(path);
     const playlistMetaLookup = this.getPlaylistMetaLookup(parsedXmlFile);
@@ -55,6 +56,19 @@ export class M3U8Tweaker {
       replacementRoot,
       playlistMetaLookup
     );
+  }
+
+  /**
+   * Validates options that cannot be entered through an interactive prompt.
+   */
+  private validateStaticOptions(): void {
+    if (this.options.targetFolder !== "") {
+      if (!fs.existsSync(this.options.targetFolder)) {
+        return this.utils.throw(
+          "The given targetFolder does not exist. (Relative paths are NOT supported.)"
+        );
+      }
+    }
   }
 
   /**
@@ -383,7 +397,10 @@ export class M3U8Tweaker {
     replacementRoot: string,
     playlistMetaLookup: PlaylistMeta
   ) {
-    const targetPath = fsPath.join(path, `m3u8tweaked`);
+    const targetPath =
+      this.options.targetFolder !== ""
+        ? this.options.targetFolder
+        : fsPath.join(path, `m3u8tweaked`);
     if (!fs.existsSync(targetPath)) {
       await fsPromises.mkdir(targetPath);
     }

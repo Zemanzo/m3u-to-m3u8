@@ -13,6 +13,11 @@ program
     ""
   )
   .option(
+    "-t, --targetFolder <path>",
+    "Location where the converted playlists will be stored. If left empty, it will be placed in a folder 'm3u8tweaked' next to the input files. Does NOT support relative paths.",
+    ""
+  )
+  .option(
     "-ni, --notInteractive",
     "Whether questions should be asked to get missing data. \nFor example, when --newRoot is missing, a prompt will appear asking you to type the new root path.\nUseful for automated systems.",
     false

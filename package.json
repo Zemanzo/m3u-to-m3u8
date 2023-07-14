@@ -1,6 +1,7 @@
 {
   "name": "m3u8-tweaks",
   "version": "1.0.0",
+  "author": "Merlijn van der Kamp",
   "description": "CLI tool to convert Winamp playlists so they work with Music Player Daemon",
   "type": "module",
   "engines": {
@@ -32,8 +33,6 @@
     "lint": "eslint . --ext .ts --ext .mts",
     "prettier": "prettier --config .prettierrc --write ."
   },
-  "author": "Jakub Synowiec <jsynowiec@users.noreply.github.com>",
-  "license": "Apache-2.0",
   "dependencies": {
     "chalk": "^5.2.0",
     "cli-progress": "^3.11.2",
