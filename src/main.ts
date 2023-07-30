@@ -1,340 +1,478 @@
+import fs from "node:fs";
+import fsPromises from "node:fs/promises";
+import fsPath from "node:path";
+import readlinePromises from "node:readline/promises";
+import { OptionValues } from "commander";
 import chalk from "chalk";
-import { program } from "commander";
-import { M3U8Tweaker } from "./program.js";
+import sanitizeFileName from "sanitize-filename";
+import cliProgress from "cli-progress";
+import promptly from "promptly";
+import xml2js from "xml2js";
+import {
+  ExcludedFiles,
+  ParsedXmlFile,
+  PlaylistMeta,
+  XmlPlaylistEntry
+} from "./types.js";
+import Utils from "./utils.js";
+import { getFirstEntry, findLargestCommonPrefix } from "./playlistUtils.js";
 
-program
-  .option(
-    "-o, --oldRoot <path>",
-    "The original root that is used for tracks in the playlists. When no value is given, it will automatically detect a common root file path."
-  )
-  .option(
-    "-n, --newRoot <path>",
-    "The new root that is used as a replacement for all tracks.",
-    ""
-  )
-  .option(
-    "-t, --targetFolder <path>",
-    "Location where the converted playlists will be stored. If left empty, it will be placed in a folder 'm3u8tweaked' next to the input files. Does NOT support relative paths.",
-    ""
-  )
-  .option(
-    "-ni, --notInteractive",
-    "Whether questions should be asked to get missing data. \nFor example, when --newRoot is missing, a prompt will appear asking you to type the new root path.\nUseful for automated systems.",
-    false
-  )
-  .option("-px, --purgeXml", "Purge playlists that are not in the XML.", true)
-  .option(
-    "-pm, --purgeMismatch",
-    "Purge playlists that have tracks that do not match the original root. http streams are always ignored and will be kept.",
-    true
-  )
-  .option(
-    "-r, --rename",
-    "Rename playlists to the name found in the XML.",
-    true
-  )
-  .option("-v, --verbose", "Show additional info and error logging.", false)
-  .option(
-    "-s, --silent",
-    "Do not log anything. Takes precedence over --verbose.",
-    false
-  );
+const PLAYLISTS_XML_FILE = "playlists.xml";
+const xmlParser = new xml2js.Parser();
 
-program
-  .name(chalk.bgBlue("m3u8tweaks"))
-  .usage(chalk.blue("[options] folderPath"));
-program.description(
-  chalk.italic(
-    `Convert Winamp playlists so they work with Music Player Daemon.`
-  )
-);
+export class M3U8Tweaker {
+  options: OptionValues;
+  utils: Utils;
 
-let path: unknown;
-const lastArgument = process.argv[process.argv.length - 1];
-if (!lastArgument.startsWith("-") && process.argv.length > 2) {
-  path = process.argv.pop();
+  constructor(options: OptionValues) {
+    this.options = options;
+    this.utils = new Utils(options);
+  }
+
+  async run(initialPath: unknown) {
+    this.validateStaticOptions();
+    const path = await this.getPath(initialPath);
+    const { playlistFiles, parsedXmlFile } = await this.getFiles(path);
+    const playlistMetaLookup = this.getPlaylistMetaLookup(parsedXmlFile);
+    this.purgeAndReport(playlistFiles, playlistMetaLookup, parsedXmlFile);
+    const { oldRoot, excludeIndices } = await this.getOldRoot(
+      path,
+      playlistFiles,
+      playlistMetaLookup
+    );
+    const replacementRoot = await this.getReplacementRoot();
+    await this.checkConfig(
+      path,
+      playlistFiles,
+      excludeIndices,
+      oldRoot,
+      replacementRoot
+    );
+    await this.transformFilesUsingConfiguration(
+      path,
+      playlistFiles,
+      excludeIndices,
+      oldRoot,
+      replacementRoot,
+      playlistMetaLookup
+    );
+  }
+
+  /**
+   * Validates options that cannot be entered through an interactive prompt.
+   */
+  private validateStaticOptions(): void {
+    if (this.options.targetFolder !== "") {
+      if (!fs.existsSync(this.options.targetFolder)) {
+        return this.utils.throw(
+          "The given targetFolder does not exist. (Relative paths are NOT supported.)"
+        );
+      }
+    }
+  }
+
+  /**
+   * Prompts user for a new path if none is given, throws if path is invalid.
+   */
+  private async getPath(path: unknown): Promise<string> {
+    if (!this.options.notInteractive) {
+      if (!path || typeof path !== "string") {
+        path = await promptly.prompt(
+          chalk.blue(
+            "Enter the path of the folder that contains your playlists"
+          )
+        );
+      }
+    }
+
+    if (path === "" || typeof path !== "string") {
+      return this.utils.throw("Missing `path` argument.");
+    }
+
+    if (!fs.existsSync(path)) {
+      return this.utils.throw(
+        `Given path "${chalk.gray(path)}" does not exist.`
+      );
+    }
+
+    return path;
+  }
+
+  /**
+   * Gets playlist files & XML file.
+   */
+  private async getFiles(path: string) {
+    this.utils.log("Checking ", chalk.gray(path));
+
+    let files: string[] | undefined;
+    try {
+      files = await fsPromises.readdir(path, { encoding: "utf-8" });
+    } catch (err) {
+      return this.utils.throw(
+        `Could not read directory ${path}, are you sure this is a directory?`,
+        err
+      );
+    }
+
+    const playlistFiles: string[] = [];
+    let hasXmlFile = false;
+    for (const file of files) {
+      if (file.endsWith(".m3u8")) {
+        playlistFiles.push(file);
+      }
+      if (file === PLAYLISTS_XML_FILE) {
+        hasXmlFile = true;
+      }
+    }
+
+    if (playlistFiles.length === 0) {
+      return this.utils.throw(`No playlist files found.`);
+    }
+
+    if (!hasXmlFile) {
+      return this.utils.throw(`Playlists XML file not found.`);
+    }
+
+    const parsedXmlFile = await this.getParsedXmlFile(path);
+
+    return { playlistFiles, parsedXmlFile };
+  }
+
+  /**
+   * Gets XML file and parses it to a readable format.
+   */
+  private async getParsedXmlFile(path: string) {
+    let parsedXmlFile: ParsedXmlFile;
+    try {
+      const xmlFile = await fsPromises.readFile(
+        fsPath.join(path, PLAYLISTS_XML_FILE),
+        {
+          encoding: "utf16le"
+        }
+      );
+      parsedXmlFile = await xmlParser.parseStringPromise(xmlFile);
+    } catch (err) {
+      this.utils.error(err);
+      return this.utils.throw(`Could not parse playlists XML file.`);
+    }
+    return parsedXmlFile;
+  }
+
+  /**
+   * Creates an easily accessible Map of playlist files.
+   */
+  private getPlaylistMetaLookup(parsedXmlFile: ParsedXmlFile) {
+    return parsedXmlFile.playlists.playlist.reduce<PlaylistMeta>(
+      (lookupMap, playlist) => {
+        lookupMap.set(playlist.$.filename, playlist.$);
+        return lookupMap;
+      },
+      new Map<string, XmlPlaylistEntry["$"]>()
+    );
+  }
+
+  /**
+   * Filter out playlists that are not in the XML, and inform the user about
+   * the results.
+   */
+  private purgeAndReport(
+    playlistFiles: string[],
+    playlistMetaLookup: PlaylistMeta,
+    parsedXmlFile: ParsedXmlFile
+  ) {
+    if (this.options.purgeXml) {
+      const lengthBeforePurge = playlistFiles.length;
+      this.utils.filterInPlace(
+        playlistFiles,
+        (val) => playlistMetaLookup.get(val) !== undefined
+      );
+
+      this.utils.log(
+        `Ignoring ${chalk.red(
+          lengthBeforePurge - playlistFiles.length
+        )} playlists that are not in the XML.`
+      );
+    }
+
+    const plural = playlistFiles.length === 1 ? "" : "s";
+
+    this.utils.log(
+      `Found ${chalk.green(
+        playlistFiles.length.toString()
+      )} playlist${plural}, XML references ${chalk.green(
+        parsedXmlFile.playlists.$.playlists
+      )} playlists.`
+    );
+  }
+
+  private async getOldRoot(
+    path: string,
+    playlistFiles: string[],
+    playlistMetaLookup: PlaylistMeta
+  ) {
+    if (this.options.oldRoot) {
+      return this.determineExcludedFiles(path, playlistFiles);
+    } else {
+      return this.determineCommonRootAndExcludedFiles(
+        path,
+        playlistFiles,
+        playlistMetaLookup
+      );
+    }
+  }
+
+  /**
+   * Gets the file path of the first track in every playlist. Also creates a
+   * list of all http-stream tracks, which can be skipped.
+   */
+  private async getFirstTrackFilePaths(path: string, playlistFiles: string[]) {
+    const pathsPromises: Array<Promise<string>> = new Array(
+      playlistFiles.length
+    );
+    for (let i = 0; i < playlistFiles.length; i++) {
+      pathsPromises[i] = getFirstEntry(path, playlistFiles[i]);
+    }
+    const resolvedPaths = await Promise.all(pathsPromises);
+    const httpStreamPathIndices = resolvedPaths.reduce<number[]>(
+      (httpPaths, filePath, i) => {
+        if (filePath.startsWith("http://") || filePath.startsWith("https://")) {
+          httpPaths.push(i);
+        }
+        return httpPaths;
+      },
+      []
+    );
+
+    if (httpStreamPathIndices.length > 0) {
+      this.utils.log(
+        `Found ${chalk.green(
+          httpStreamPathIndices.length
+        )} playlists with an http stream entry, ignorning these for common prefix.`
+      );
+    }
+
+    return { resolvedPaths, httpStreamPathIndices };
+  }
+
+  /**
+   * Uses the passed root to check which files need to be exluded.
+   */
+  private async determineExcludedFiles(path: string, playlistFiles: string[]) {
+    const { resolvedPaths, httpStreamPathIndices } =
+      await this.getFirstTrackFilePaths(path, playlistFiles);
+
+    const excludeIndices: number[] = [];
+    for (let i = 0; i < resolvedPaths.length; i++) {
+      const path = resolvedPaths[i];
+      if (
+        path.startsWith(this.options.oldRoot) &&
+        !httpStreamPathIndices.includes(i)
+      ) {
+        excludeIndices.push(i);
+      }
+    }
+
+    if (
+      excludeIndices.length + httpStreamPathIndices.length ===
+      resolvedPaths.length
+    ) {
+      return this.utils.throw(
+        `Common prefix '${this.options.oldRoot}' is not available`,
+        resolvedPaths
+      );
+    }
+
+    return { oldRoot: this.options.oldRoot, excludeIndices };
+  }
+
+  /**
+   * Automatically gets the common root, and excludes files based on the root
+   * found.
+   */
+  private async determineCommonRootAndExcludedFiles(
+    path: string,
+    playlistFiles: string[],
+    playlistMetaLookup: PlaylistMeta
+  ) {
+    const { resolvedPaths, httpStreamPathIndices } =
+      await this.getFirstTrackFilePaths(path, playlistFiles);
+
+    this.utils.log(
+      "Using first entry of first playlist as baseline for checking others: ",
+      chalk.gray(resolvedPaths[0])
+    );
+    const { commonPrefix, excludeIndices } = findLargestCommonPrefix(
+      resolvedPaths.filter(
+        (val, index) => !httpStreamPathIndices.includes(index)
+      )
+    );
+
+    if (commonPrefix === "") {
+      return this.utils.throw("Could not find a common prefix!", resolvedPaths);
+    }
+
+    let excludedFiles: ExcludedFiles = [];
+    if (excludeIndices) {
+      excludedFiles = excludeIndices.reduce<ExcludedFiles>((acc, i) => {
+        if (!httpStreamPathIndices.includes(i)) {
+          acc.push({
+            title: playlistMetaLookup.get(playlistFiles[i])?.title ?? "-",
+            path: fsPath.join(path, playlistFiles[i]),
+            file: playlistFiles[i]
+          });
+        }
+        return acc;
+      }, []);
+      this.utils.log(
+        chalk.red(
+          "↓ Not all files have a common prefix, will skip these files ↓"
+        )
+      );
+      this.utils.table(excludedFiles, ["title", "path"]);
+      this.utils.log(
+        chalk.red(
+          "↑ Not all files have a common prefix, will skip these files ↑"
+        )
+      );
+    }
+
+    return { oldRoot: commonPrefix, excludeIndices };
+  }
+
+  private getReplacementRoot() {
+    if (typeof this.options.newRoot === "string") {
+      return this.options.newRoot;
+    } else if (!this.options.notInteractive) {
+      return promptly.prompt(
+        chalk.blue("Enter the new root that is used as a replacement: "),
+        { default: "" }
+      );
+    } else {
+      this.utils.throw(chalk.red("No replacement path given"));
+    }
+  }
+
+  /**
+   * Shows configuration and prompts for correctness when interactive.
+   */
+  private async checkConfig(
+    path: string,
+    playlistFiles: string[],
+    excludeIndices: number[],
+    oldRoot: string,
+    replacementRoot: string
+  ) {
+    this.utils.log("\n");
+    this.utils.log(chalk.bold("FINAL CONFIGURATION:"));
+    this.utils.log(
+      "Folder: " +
+        chalk.gray(path) +
+        ` (${playlistFiles.length} playlists, ${excludeIndices.length} skipped)`
+    );
+    this.utils.log("Current root: " + chalk.gray(oldRoot));
+    this.utils.log("Replacement root: " + chalk.gray(replacementRoot));
+    this.utils.log("\n");
+
+    if (!this.options.notInteractive) {
+      const proceed = await promptly.confirm(
+        "Are these settings correct & do you wish to proceed? " +
+          chalk.gray(" y / n ")
+      );
+      if (!proceed) {
+        this.utils.throw("Aborted -- incorrect configuration.");
+      }
+    }
+  }
+
+  /**
+   * The actual transformation: It uses the configuration to read and transform
+   * the playlist files into somewhat different playlist files.
+   */
+  // FIXME: Split this up further?
+  private async transformFilesUsingConfiguration(
+    path: string,
+    playlistFiles: string[],
+    excludeIndices: number[],
+    oldRoot: string,
+    replacementRoot: string,
+    playlistMetaLookup: PlaylistMeta
+  ) {
+    const targetPath =
+      this.options.targetFolder !== ""
+        ? this.options.targetFolder
+        : fsPath.join(path, `m3u8tweaked`);
+    if (!fs.existsSync(targetPath)) {
+      await fsPromises.mkdir(targetPath);
+    }
+
+    const progressBar = new cliProgress.SingleBar(
+      {},
+      cliProgress.Presets.shades_classic
+    );
+
+    // start the progress bar with a total value of 200 and start value of 0
+    progressBar.start(playlistFiles.length - excludeIndices.length, 0);
+
+    let i = -1;
+    const sanitizedNames: string[] = [];
+    for (const file of playlistMetaLookup.values()) {
+      i++;
+      if (excludeIndices.includes(i)) {
+        continue;
+      }
+
+      const filePath = fsPath.join(path, file.filename);
+      const fileStream = fs.createReadStream(filePath, {
+        encoding: "utf-8",
+        autoClose: true
+      });
+      let sanitizedName = sanitizeFileName(file.title);
+      if (sanitizedNames.includes(sanitizedName)) {
+        sanitizedName += " 2";
+        // throwError("Santized filename causes conflict", targetFile);
+      }
+      sanitizedNames.push(sanitizedName);
+      const targetFile = fsPath.join(targetPath, sanitizedName + ".m3u");
+      const writeStream = fs.createWriteStream(targetFile, {
+        encoding: "utf-8",
+        autoClose: true
+      });
+
+      const lineReader = readlinePromises.createInterface({
+        input: fileStream,
+        crlfDelay: Infinity
+      });
+      lineReader.on("error", (err) => this.utils.throw(err));
+      writeStream.on("error", (err) =>
+        this.utils.throw("error in writestream", err)
+      );
+      fileStream.on("error", (err) =>
+        this.utils.throw("error in readstream", err)
+      );
+
+      for await (const line of lineReader) {
+        // Remove first line of file
+        if (line.includes("#EXTM3U")) {
+          continue;
+        }
+        // Copy over data directly if they do not start with the given root.
+        if (!line.startsWith(oldRoot)) {
+          writeStream.write(line + "\n");
+          continue;
+        }
+        // Change the root
+        writeStream.write(
+          line.replace(oldRoot, replacementRoot).replaceAll("\\", "/") + "\n"
+        );
+      }
+
+      progressBar.increment();
+    }
+
+    progressBar.stop();
+
+    this.utils.log(
+      chalk.green(`Successfully tweaked all playlists. Happy listening!`)
+    );
+  }
 }
-program.parse(process.argv);
-
-const options = program.opts();
-
-const tweaker = new M3U8Tweaker(options);
-tweaker.run(path);
-
-// async function run(path: unknown): Promise<void> {
-//   if (options.interactive) {
-//     if (!path || typeof path !== "string") {
-//       path = await promptly.prompt(
-//         chalk.blue("Enter the path of the folder that contains your playlists")
-//       );
-//     }
-//   }
-
-//   if (path === "" || typeof path !== "string") {
-//     return throwError("Missing `path` argument.");
-//   }
-
-//   if (!fs.existsSync(path)) {
-//     return throwError(`Given path "${chalk.gray(path)}" does not exist.`);
-//   }
-
-//   console.log("Checking ", chalk.gray(path));
-
-//   let files: string[] | undefined;
-//   try {
-//     files = await fsPromises.readdir(path, { encoding: "utf-8" });
-//   } catch (err) {
-//     return throwError(
-//       `Could not read directory ${path}, are you sure this is a directory?`,
-//       err
-//     );
-//   }
-
-//   const playlistFiles: string[] = [];
-//   let hasXmlFile = false;
-//   for (const file of files) {
-//     if (file.endsWith(".m3u8")) {
-//       playlistFiles.push(file);
-//     }
-//     if (file === PLAYLISTS_XML_FILE) {
-//       hasXmlFile = true;
-//     }
-//   }
-
-//   if (!hasXmlFile) {
-//     return throwError(`Playlists XML file not found.`);
-//   }
-
-//   let parsedXmlFile: ParsedXmlFile;
-//   try {
-//     const xmlFile = await fsPromises.readFile(
-//       fsPath.join(path, PLAYLISTS_XML_FILE),
-//       {
-//         encoding: "utf16le"
-//       }
-//     );
-//     parsedXmlFile = await xmlParser.parseStringPromise(xmlFile);
-//   } catch (err) {
-//     console.error(err);
-//     return throwError(`Could not parse playlists XML file.`);
-//   }
-
-//   if (playlistFiles.length === 0) {
-//     return throwError(`No playlist files found.`);
-//   }
-
-//   const playlistMetaLookup = parsedXmlFile.playlists.playlist.reduce<
-//     Record<string, XmlPlaylistEntry["$"]>
-//   >((acc, playlist) => {
-//     acc[playlist.$.filename] = playlist.$;
-//     return acc;
-//   }, {});
-
-//   if (options.purgeXml) {
-//     const lengthBeforePurge = playlistFiles.length;
-//     filterInPlace(
-//       playlistFiles,
-//       (val) => playlistMetaLookup[val] !== undefined
-//     );
-
-//     console.log(
-//       `Ignoring ${chalk.red(
-//         lengthBeforePurge - playlistFiles.length
-//       )} playlists that are not in the XML.`
-//     );
-//   }
-
-//   const plural = playlistFiles.length === 1 ? "" : "s";
-
-//   console.log(
-//     `Found ${chalk.green(
-//       playlistFiles.length.toString()
-//     )} playlist${plural}, XML references ${chalk.green(
-//       parsedXmlFile.playlists.$.playlists
-//     )} playlists.`
-//   );
-
-//   await configureLibraryBase(path, playlistFiles, playlistMetaLookup);
-// }
-
-// async function configureLibraryBase(
-//   path: string,
-//   playlistFiles: string[],
-//   parsedXmlFile: Record<string, XmlPlaylistEntry["$"]>
-// ): Promise<void> {
-// const pathsPromises: Array<Promise<string>> = new Array(playlistFiles.length);
-// for (let i = 0; i < playlistFiles.length; i++) {
-//   pathsPromises[i] = getFirstEntry(path, playlistFiles[i]);
-// }
-// const resolvedPaths = await Promise.all(pathsPromises);
-// const httpStreamPathIndices = resolvedPaths.reduce<number[]>(
-//   (httpPaths, filePath, i) => {
-//     if (filePath.startsWith("http://") || filePath.startsWith("https://")) {
-//       httpPaths.push(i);
-//     }
-//     return httpPaths;
-//   },
-//   []
-// );
-
-// if (httpStreamPathIndices.length > 0) {
-//   console.log(
-//     `Found ${chalk.green(
-//       httpStreamPathIndices.length
-//     )} playlists with an http stream entry, ignorning these for common prefix.`
-//   );
-// }
-
-// console.log(
-//   "Using first entry of first playlist as baseline for checking others: ",
-//   chalk.gray(resolvedPaths[0])
-// );
-// const { commonPrefix, excludeIndices } = findLargestCommonPrefix(
-//   resolvedPaths.filter((val, index) => !httpStreamPathIndices.includes(index))
-// );
-
-// if (commonPrefix === "") {
-//   return throwError("Could not find a common prefix!", pathsPromises);
-// }
-
-// let excludedFiles = [];
-// if (excludeIndices) {
-//   excludedFiles = excludeIndices.reduce<
-//     Array<{ title: string; path: string; file: string }>
-//   >((acc, i) => {
-//     if (!httpStreamPathIndices.includes(i)) {
-//       acc.push({
-//         title: parsedXmlFile[playlistFiles[i]]?.title ?? "-",
-//         path: fsPath.join(path, playlistFiles[i]),
-//         file: playlistFiles[i]
-//       });
-//     }
-//     return acc;
-//   }, []);
-//   console.log(
-//     chalk.red("↓ Not all files have a common prefix, will skip these files ↓")
-//   );
-//   console.table(excludedFiles, ["title", "path"]);
-//   console.log(
-//     chalk.red("↑ Not all files have a common prefix, will skip these files ↑")
-//   );
-// }
-
-//   const correctRoot = await promptly.confirm(
-//     chalk.blue("Root appears to be ") +
-//       chalk.green(commonPrefix) +
-//       chalk.blue(", is this correct?") +
-//       chalk.gray(" Y / n "),
-//     { default: "Y" }
-//   );
-
-//   let root: string | undefined;
-//   if (correctRoot) {
-//     root = commonPrefix;
-//   } else {
-//     // FIXME: This does not change `excludeIndices`.
-//     root = await promptly.prompt(chalk.blue("Enter the correct root: "));
-//   }
-
-//   const replacementRoot = await promptly.prompt(
-//     chalk.blue("Enter the new root that is used as a replacement: "),
-//     { default: "" }
-//   );
-
-//   console.log("\n");
-//   console.log(chalk.bold("FINAL CONFIGURATION:"));
-//   console.log(
-//     "Folder: " +
-//       chalk.gray(path) +
-//       ` (${playlistFiles.length} playlists, ${excludedFiles.length} skipped)`
-//   );
-//   console.log("Current root: " + chalk.gray(root));
-//   console.log("Replacement root: " + chalk.gray(replacementRoot));
-
-//   const proceed = await promptly.confirm(
-//     "Are these settings correct & do you wish to proceed? " +
-//       chalk.gray(" y / n ")
-//   );
-//   if (!proceed) {
-//     await configureLibraryBase(path, playlistFiles, parsedXmlFile);
-//   }
-
-//   const targetPath = fsPath.join(path, `m3u8tweaked`);
-//   if (!fs.existsSync(targetPath)) {
-//     await fsPromises.mkdir(targetPath);
-//   }
-
-//   const progressBar = new cliProgress.SingleBar(
-//     {},
-//     cliProgress.Presets.shades_classic
-//   );
-
-//   // start the progress bar with a total value of 200 and start value of 0
-//   progressBar.start(playlistFiles.length - excludedFiles.length, 0);
-
-//   let i = -1;
-//   const sanitizedNames: string[] = [];
-//   for (const key in parsedXmlFile) {
-//     i++;
-//     const file = parsedXmlFile[key];
-//     if (excludeIndices.includes(i)) {
-//       continue;
-//     }
-
-//     const filePath = fsPath.join(path, file.filename);
-//     const fileStream = fs.createReadStream(filePath, {
-//       encoding: "utf-8",
-//       autoClose: true
-//     });
-//     let sanitizedName = sanitizeFileName(file.title);
-//     if (sanitizedNames.includes(sanitizedName)) {
-//       sanitizedName += " 2";
-//       // throwError("Santized filename causes conflict", targetFile);
-//     }
-//     sanitizedNames.push(sanitizedName);
-//     const targetFile = fsPath.join(targetPath, sanitizedName + ".m3u");
-//     const writeStream = fs.createWriteStream(targetFile, {
-//       encoding: "utf-8",
-//       autoClose: true
-//     });
-
-//     const lineReader = readlinePromises.createInterface({
-//       input: fileStream,
-//       crlfDelay: Infinity
-//     });
-//     lineReader.on("error", (err) => throwError(err));
-//     writeStream.on("error", (err) => throwError("error in writestream", err));
-//     fileStream.on("error", (err) => throwError("error in readstream", err));
-
-//     for await (const line of lineReader) {
-//       // Remove first line of file
-//       if (line.includes("#EXTM3U")) {
-//         continue;
-//       }
-//       // Copy over data directly if they do not start with the given root.
-//       if (!line.startsWith(root)) {
-//         writeStream.write(line + "\n");
-//         continue;
-//       }
-//       // Change the root
-//       writeStream.write(
-//         line.replace(root, replacementRoot).replaceAll("\\", "/") + "\n"
-//       );
-//     }
-
-//     progressBar.increment();
-//   }
-
-//   progressBar.stop();
-
-//   console.log(
-//     chalk.green(`Successfully tweaked all playlists. Happy listening!`)
-//   );
-// }
-// function failIfNotInteractive(option: string) {
-//   if (!options.interactive) {
-//     throwError(
-//       `Interactive mode is disabled, but missing value for option '${option}'.`
-//     );
-//   }
-// }
