@@ -18,6 +18,7 @@ import Utils from "./utils.js";
 import { getFirstEntry, findLargestCommonPrefix } from "./playlistUtils.js";
 
 const PLAYLISTS_XML_FILE = "playlists.xml";
+const META_FILENAME = "meta.txt";
 const xmlParser = new xml2js.Parser();
 
 export class M3U8Tweaker {
@@ -33,6 +34,7 @@ export class M3U8Tweaker {
     this.validateStaticOptions();
     const path = await this.getPath(initialPath);
     const { playlistFiles, parsedXmlFile } = await this.getFiles(path);
+    const lastModified = await this.checkLastModified(path, playlistFiles);
     const playlistMetaLookup = this.getPlaylistMetaLookup(parsedXmlFile);
     this.purgeAndReport(playlistFiles, playlistMetaLookup, parsedXmlFile);
     const { oldRoot, excludeIndices } = await this.getOldRoot(
@@ -54,7 +56,8 @@ export class M3U8Tweaker {
       excludeIndices,
       oldRoot,
       replacementRoot,
-      playlistMetaLookup
+      playlistMetaLookup,
+      lastModified
     );
   }
 
@@ -254,6 +257,44 @@ export class M3U8Tweaker {
     return { resolvedPaths, httpStreamPathIndices };
   }
 
+  private async checkLastModified(path: string, playlistFiles: string[]) {
+    const fsStatPromises: Array<Promise<fs.Stats>> = new Array(
+      playlistFiles.length
+    );
+    for (let i = 0; i < playlistFiles.length; i++) {
+      const filePath = fsPath.join(path, playlistFiles[i]);
+      fsStatPromises[i] = fsPromises.stat(filePath);
+    }
+
+    const stats = await Promise.all(fsStatPromises);
+    const lastModified = stats.reduce<number>((lastestModified, stat) => {
+      lastestModified = Math.max(stat.mtimeMs, lastestModified);
+      return lastestModified;
+    }, 0);
+
+    const targetPath = this.getTargetPath(path);
+    const metaFilePath = fsPath.join(targetPath, META_FILENAME);
+    try {
+      const metaLastModified = fs.readFileSync(metaFilePath, {
+        encoding: "utf-8"
+      });
+      if (lastModified <= parseFloat(metaLastModified)) {
+        this.utils.log(
+          `No changes since last time (${metaLastModified}, most recent change was ${lastModified}), exiting...`
+        );
+        process.exit(0);
+      } else {
+        this.utils.log(`(${metaLastModified}, ${lastModified})`);
+      }
+    } catch (err) {
+      this.utils.warn(
+        `Meta file not found in target folder, skipping lastModified check.`
+      );
+    }
+
+    return lastModified;
+  }
+
   /**
    * Uses the passed root to check which files need to be exluded.
    */
@@ -384,6 +425,12 @@ export class M3U8Tweaker {
     }
   }
 
+  private getTargetPath(path: string) {
+    return this.options.targetFolder !== ""
+      ? this.options.targetFolder
+      : fsPath.join(path, `m3u8tweaked`);
+  }
+
   /**
    * The actual transformation: It uses the configuration to read and transform
    * the playlist files into somewhat different playlist files.
@@ -395,14 +442,17 @@ export class M3U8Tweaker {
     excludeIndices: number[],
     oldRoot: string,
     replacementRoot: string,
-    playlistMetaLookup: PlaylistMeta
+    playlistMetaLookup: PlaylistMeta,
+    lastModified: number
   ) {
-    const targetPath =
-      this.options.targetFolder !== ""
-        ? this.options.targetFolder
-        : fsPath.join(path, `m3u8tweaked`);
+    const targetPath = this.getTargetPath(path);
     if (!fs.existsSync(targetPath)) {
       await fsPromises.mkdir(targetPath);
+    }
+
+    const metaFilePath = fsPath.join(targetPath, META_FILENAME);
+    if (!fs.existsSync(metaFilePath)) {
+      fs.writeFileSync(metaFilePath, String(lastModified));
     }
 
     const progressBar = new cliProgress.SingleBar(
